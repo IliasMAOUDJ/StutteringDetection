@@ -1,0 +1,193 @@
+seed: 124
+hpopt_mode: orion
+hpopt: hpopt.yaml
+ckpt_enable: False
+TestOurs: False
+#--------------------------------- hparams ------------------------------------
+dataset: fluencybank
+balance: True
+balance_ratio: 0.4
+balance_test: False
+number_of_epochs: 1
+annot_value: 2
+n_mels: 200
+siamese: False
+dropout: 0.4
+dataset_mean: -20.86
+dataset_std: 9.25
+
+#---------------------------------- Classes -----------------------------------
+# 1+number of disfluencies to classify
+Prolongation: True
+Block: True
+SoundRep: True
+WordRep: True
+Interjection: True
+num_class: !!python/object/apply:eval [ !ref <Prolongation> + <Block> + <SoundRep> + <WordRep> + <Interjection>]
+#----------------------------------- Feats ------------------------------------
+input_freq: 16000
+resample_freq: 16000
+features:
+    preaugment: False
+    normalize: False
+    augment: False
+compute_feats: !new:model.features.FBank
+    input_freq: !ref <input_freq>
+    resample_freq: !ref <resample_freq>
+    n_mels: !ref <n_mels>
+    n_mfcc: 47
+    n_fft: 2048
+    hop_length: 10
+    win_length: 25
+    feats: !ref <feats>
+feats: mfcc
+
+spec_augment: !new:speechbrain.lobes.augment.SpecAugment
+    n_freq_mask: 2
+    freq_mask_width: 4
+    time_mask: True
+    time_mask_width: (0,5)
+    replace_with_zero: True
+
+#----------------------------------- Loss -------------------------------------
+weights: !new:torch.Tensor
+    data: [5.31,8.18,7.67,1.88,4.88,8.87] #Repetition, Prolongation, Block, Interjection, Fluent
+weight: 12
+inverse_weight:  !!python/object/apply:eval [1 / 1 ]
+
+positive: 0.1
+weight_fl: 1
+weight_dis: 1
+
+multi_loss: !new:torch.nn.CrossEntropyLoss
+#    weight: !new:torch.Tensor
+#        data: 
+#          - !ref <weight_fl>
+#          - !ref <weight_dis>
+
+
+jouaitiloss: !new:model.losses.JouaitiLoss  
+ADM_loss: !new:model.losses.AdMSoftmaxLoss 
+    in_features: 2
+    out_features: 2
+#----------------------------------- Model ------------------------------------
+models: wav2vec2
+my_model: !new:model.models.ResNet18Arch
+    in_channels: 1
+    resblock: !ref <resblock>
+    outputs: !ref <hidden_size>*2
+
+resblock: !name:model.models.ResBlock
+  
+custom: !new:model.models.JouaitiEtAl
+    in_dim: 940
+    hidden_dim: 128
+    num_output_channels: 256
+    num_class: !ref <num_class>
+fc_dim: !ref <hidden_size>*2
+in_feat: !apply:speechbrain.utils.hparams.choice
+        value: !ref <models>
+        choices:
+            resbilstm: !ref <fc_dim>
+            #resnet: !ref <resnet>
+            wav2vec2: !ref <wav2vec2_input>
+            
+        default: 512
+
+layers: 0 5 10 12
+backbone: ResArch #vit_base_resnet50_384 #resnet18 #vit_small_patch16_224_dino #
+w2v2layers: 3
+with_pooling: True
+pool_time: True
+model: !new:model.models.MyWav2vec2
+    wav2vec2: !ref <wav2vec2>
+    layers: !ref <layers>
+    mean: True
+    std: True
+    with_pooling: !ref <with_pooling>
+    pool_time: <pool_time>
+    dropout: !ref <dropout>
+    output_all_hiddens: False
+    num_class: !ref <num_class>
+wav2vec2: !new:speechbrain.lobes.models.huggingface_wav2vec.HuggingFaceWav2Vec2
+    source: facebook/wav2vec2-base-960h #LeBenchmark/wav2vec2-FR-7K-base #facebook/wav2vec2-base-960h #jonatasgrosman/wav2vec2-large-xlsr-53-english #FR LeBenchmark/wav2vec2-FR-7K-base 
+    save_path: /LibriStutter_data/hugging_face
+    output_all_hiddens: False
+    freeze: True
+    freeze_feature_extractor: True
+lstm: !new:speechbrain.nnet.RNN.LSTM
+    hidden_size: !ref <hidden_size>
+    input_size: 512
+    bidirectional: True
+    num_layers: 1
+    dropout: 0.4
+hidden_size: 512  
+resbilstm: !new:model.models.ResNetBiLSTM
+    resnet: !ref <backbone>
+    bilstm: !ref <lstm>
+    num_classes: !ref <num_class>
+    freeze: False
+    fc_dim: !ref <fc_dim>
+    layers_to_freeze: 0
+    pretrain: True
+    
+bin_classifier: !new:torch.nn.Linear
+    in_features: 1024
+    out_features: 1
+
+multi_classifier: !new:torch.nn.Linear
+    in_features: 1024
+    out_features: !ref <num_class>
+#-------------------------------- Scheduling ----------------------------------
+batch_size: 32
+dataloader_opts:
+    batch_size: !ref <batch_size>
+    shuffle: True
+
+learning_rate: 0.0001
+opt_class: !name:torch.optim.Adam
+    lr: !ref <learning_rate>
+
+annealing: False
+lr_annealing: !new:speechbrain.nnet.schedulers.CyclicCosineScheduler
+    lr_initial: !ref <learning_rate>
+    n_warmup_steps: 1
+    total_steps: 100
+    #patient: 7 
+    
+#---------------------------------- Misc --------------------------------------
+
+__set_seed: !apply:torch.manual_seed [!ref <seed>]
+output_folder: !ref results/<seed>
+
+counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+modules:
+    w2v2_model: !ref <model>
+    custom: !ref <custom>
+    my_model: !ref <my_model>
+    resbilstm: !ref <resbilstm>
+    multi_loss: !ref <multi_loss>
+    jouaitiloss: !ref <jouaitiloss>
+    compute_feats: !ref <compute_feats>
+    bin_classifier: !ref <bin_classifier>
+    multi_classifier: !ref <multi_classifier>
+
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        w2v2_model: !ref <model>
+        counter: !ref <counter>
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+
+resnet: 512
+ecapa: 192
+wav2vec2_input: 768
+vit: 768
+
