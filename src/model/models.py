@@ -78,17 +78,6 @@ class ClassificationLayer(nn.Module):
         return out
 
 
-class AlBanna(nn.Module):
-    def __init__(self):
-        super(AlBanna, self).__init__()
-        self.wav2vec2 = sb.lobes.models.huggingface_transformers.wav2vec2.Wav2Vec2("facebook/wav2vec2-base-960h",
-                                                                                 freeze=True,
-                                                                                 freeze_feature_extractor=True,
-                                                                                 save_path="./hugging_face")
-    def forward(self, x):
-
-        return bin_out
-
 class JouaitiEtAl(nn.Module):
     def __init__(self, in_dim, hidden_dim,num_output_channels):
         super(JouaitiEtAl, self).__init__()
