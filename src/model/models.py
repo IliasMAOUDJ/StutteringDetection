@@ -236,34 +236,7 @@ class Sheikh2022(nn.Module):
         out = torch.index_select(x,1,torch.tensor([0,6,10]).to("cuda:0"))
         bin_out = self.bin_classifier(out)
         return bin_out
-    
-class Bayerl(nn.Module):
-    def __init__(self, stop_layer=12, freeze = False, freeze_ft_ex=True):
-        super(Bayerl, self).__init__()
-        self.wav2vec2 = sb.lobes.models.huggingface_transformers.wav2vec2.Wav2Vec2("facebook/wav2vec2-base-960h",
-                                                                                 freeze=freeze,
-                                                                                 freeze_feature_extractor=freeze_ft_ex,
-                                                                                 save_path="./hugging_face",
-                                                                                 output_all_hiddens=True,
-                                                                                 output_norm=True)
-        
-        self.fc1 = nn.Sequential(nn.Linear(in_features= 768,out_features=256, bias=True),
-                                 nn.LeakyReLU())
-                                 
-        self.pooling = sb.nnet.pooling.StatisticsPooling(return_mean=True, return_std=False)
-        self.cls_head = nn.Linear(in_features=256, out_features=1, bias=False)
-        self.bin_classifier = ClassificationLayer(256, dropout=0.4)
-        self.stop_layer = stop_layer
-    
-    def forward(self, x):
-        x = self.wav2vec2(x)
-        x = x.permute(1,0,2,3)
-        out = x[:,self.stop_layer]
-        out = self.fc1(out)
-        out = self.pooling(out) #.permute(0,2,1)
-        bin_out = self.bin_classifier(out)
-        #bin_out = self.cls_head(out.squeeze())
-        return bin_out
+
 
 class Whisper(nn.Module):
     def __init__(self):
