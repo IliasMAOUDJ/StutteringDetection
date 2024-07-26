@@ -8,7 +8,7 @@ import numpy as np
 from collections import defaultdict
 
 SAMPLE_RATE = 16000
-def segmenting_collate_fn(examples, segment_length, num_class, isSiamese):
+def segmenting_collate_fn(examples, segment_length, num_class):
     # Iterate segments
     segments = []
     for example in examples:
@@ -21,39 +21,24 @@ def segmenting_collate_fn(examples, segment_length, num_class, isSiamese):
                 my_dict[example["stutter_list"][i]].append([example["splits"][i], example["splits"][i+1]])
         
         for seg_index in range(max_index):
-            segment = compute_segment(example, length, my_dict, seg_index, segment_length, num_class, isSiamese)
+            segment = compute_segment(example, length, my_dict, seg_index, segment_length, num_class)
             if(segment is not None):
                 segments.append(segment)
     return PaddedBatch(segments)
 
 
-def compute_pair_segment(example, segment_length, num_class):
-    segments = []
-    # Iterate segments
-    length = len(example["waveform"]) / SAMPLE_RATE
-    max_index = int(max(length // segment_length, 0)) +1 
-    my_dict= defaultdict(list)
-    for i in range(len(example["stutter_list"])):
-        if(example["stutter_list"][i]!="."):
-            my_dict[example["stutter_list"][i]].append([example["splits"][i], example["splits"][i+1]])
-    for seg_index in range(max_index):   
-        segment = compute_segment(example, length, my_dict, seg_index, segment_length, num_class, isSiamese = True, is_pair=True)
-        if(segment is not None):
-            segments.append(segment)
-    if(len(segments)>0):
-        choice = np.random.choice(segments)
-    return choice
-
-def compute_segment(example, length, my_dict, seg_index, segment_length, num_class, isSiamese = False, is_pair=False):
+def compute_segment(example, length, my_dict, seg_index, segment_length, num_class):
     seg_start = seg_index * segment_length
     seg_end = min(seg_start + segment_length, length)
+    #stutter_dict = {
+    #    ".":0,
+    #    "sound_rep":1, 
+    #    "word_rep":2, 
+    #    "phrase_rep":3, 
+    #    "prolongation":4
+    #}
     stutter_dict = {
-        ".":0,
-        "sound_rep":1, 
-        "word_rep":2, 
-        "phrase_rep":3, 
-        "prolongation":4
-    }
+        ".":0, "repetition":1, "blocage":2, "circumlocution":3}
     stutters =[]
     partial_stutters= []
     for el in my_dict:
@@ -148,57 +133,12 @@ def compute_segment(example, length, my_dict, seg_index, segment_length, num_cla
         if(stutters_tensor.any()):
             label[0] = 1
     
-    if(not is_pair):
-        if(isSiamese):
-            pairs = example["pairs"]
-            pair_segment=None
-            while(pair_segment==None):
-                try:
-                    raw_pair = np.random.choice(pairs)
-                    pair_example = compute_pair(raw_pair)
-                    pair_segment = compute_pair_segment(pair_example, segment_length, num_class)
-                except: 
-                    print(example)
-                    return None
-            return {
-                "id": example["id"] + f"_{seg_index}",
-                "spk_id": example["spk_id"],
-                "label": label.flatten(),
-                #"timestamps": timestamps_tensor.flatten(),
-                "waveform": waveform,
-                "pair_waveform": pair_segment["waveform"],
-                #"pair_timestamps": pair_segment["timestamps"],
-                "pair_label": pair_segment["label"]
-            }
-        return {
-                "id": example["id"] + f"_{seg_index}",
-                "spk_id": example["spk_id"],
-                "label": label.flatten(),
-                #"timestamps": timestamps_tensor.flatten(),
-                "waveform": waveform
-            }
-    else:
-        return {
+    return {
+            "id": example["id"] + f"_{seg_index}",
             "label": label.flatten(),
-            "waveform": waveform,
-            #"timestamps": timestamps_tensor.flatten()
+            #"timestamps": timestamps_tensor.flatten(),
+            "waveform": waveform
         }
-
-def compute_pair(example):
-    keys = ["waveform", "spk_id", "splits", "stutter_list"]
-    pair = {key: None for key in keys}
-    pair["waveform"] = audio_pipeline(example["wav"])
-    pair["label"] = get_label(example["contain_stutter"])
-    pair["spk_id"] = get_speaker_id(example["speaker"])
-    pair["splits"] = split_pipeline(example["breaks"])
-    
-    pair["stutter_list"]= stutter_pipeline(example["stutter_type"])
-    return pair
-
-TRAIN_PAIR_DATA = []
-VALID_PAIR_DATA = []
-TEST_PAIR_DATA = []
-CURRENT_DATA =[]
 
 from torchaudio import transforms
 def audio_pipeline(wav):
@@ -256,9 +196,9 @@ def dataio_prep(hparams):
         yield pairs
 
     @sb.utils.data_pipeline.takes("contain_stutter")
-    @sb.utils.data_pipeline.provides("label")
+    @sb.utils.data_pipeline.provides("label", "disfluency")
     def get_label(contain):
-        return contain
+        return contain, contain
 
     @sb.utils.data_pipeline.takes("breaks")
     @sb.utils.data_pipeline.provides("splits")
@@ -266,40 +206,24 @@ def dataio_prep(hparams):
         splits = [float(f) for f in breaks.strip().split()]
         return torch.FloatTensor(splits)
     @sb.utils.data_pipeline.takes("stutter_type")
-    @sb.utils.data_pipeline.provides("stutter_list")
+    @sb.utils.data_pipeline.provides("stutter_list", "origin")
     def stutter_pipeline(stutter_type):
         stutter_list = stutter_type.strip().split()
-        return stutter_list
+        return stutter_list, "synthetic"
 
     datasets = {}
     for dataset in ["train", "valid", "test"]:
-        isSiamese = hparams["siamese"]
-        if(isSiamese):
-            pair_data = sb.dataio.dataio.load_data_json(hparams[f"{dataset}_manifest"]+f"_{isSiamese}_{hparams['fold']}_pair.json",
-                                                    replacements={"data_root": hparams["data_folder"]})
-            if(dataset=="train"):
-                TRAIN_PAIR_DATA = pair_data
-            elif(dataset=="valid"):
-                VALID_PAIR_DATA = pair_data
-            else:
-                TEST_PAIR_DATA = pair_data
         datasets[f"{dataset}"] = sb.dataio.dataset.DynamicItemDataset.from_json(
-            json_path=f"/LibriStutter_data/{dataset}_libri.json",
-            replacements={"data_root": "/LibriStutter_data/LibriStutter"},
+            json_path=f"/data/csv/{dataset}_syn.json",
             dynamic_items=[
-                get_speaker_id, get_label, audio_pipeline, split_pipeline, stutter_pipeline
+                get_label, audio_pipeline, split_pipeline, stutter_pipeline
             ],
             output_keys=[
-                "id", "spk_id", "waveform", "label", "splits", "stutter_list", "pairs"
+                "id", "waveform", "label", "disfluency", "splits", "stutter_list", "origin"
             ],
         )
-        if(isSiamese):
-            for el in datasets[f"{dataset}"]:
-                if (el["pairs"] ==[]):
-                    del datasets[f"{dataset}"][el]
     hparams["dataloader_opts"]["collate_fn"] = lambda batch: segmenting_collate_fn(batch, segment_length=3, 
-                                                                                    num_class=hparams["num_class"],
-                                                                                    isSiamese= hparams["siamese"])
+                                                                                    num_class=hparams["num_class"])
     return datasets
 
 def plot_fbank(writer, spec,i, label, epoch, title=None, ylabel="freq_bin", aspect="auto", xmax=None, filename = None):

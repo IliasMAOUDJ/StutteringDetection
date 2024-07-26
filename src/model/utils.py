@@ -1,17 +1,17 @@
 
-from sklearn.metrics import multilabel_confusion_matrix, confusion_matrix, f1_score, accuracy_score
-from sklearn.metrics import precision_recall_fscore_support as score
+from sklearn.metrics import confusion_matrix
 from sklearn.manifold import TSNE
-
-import seaborn as sns
 import numpy as np
 import pandas as pd
+import torch
 import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
 
 def my_confusion_matrix(y_trues, y_preds, bin):
     # constant for classes  
+    y_preds = torch.round(y_preds)
     if(bin<=1):
-        
         cf_matrix= confusion_matrix(y_trues.cpu().detach().numpy(), 
                                     y_preds.cpu().detach().numpy())
         TP = cf_matrix[1,1]
@@ -24,17 +24,19 @@ def my_confusion_matrix(y_trues, y_preds, bin):
             fscores = 0
         accuracy = (TP+TN)/(TP+TN+FN+FP)
         missrate = FN / (FN+TP)
+        if(TP+FP > 0):
+            precision = TP / (TP+FP)
+        else:
+            precision = 0
+        recall = TP / (TP+FN)
             
     else:
-        cf_matrix = multilabel_confusion_matrix(y_trues.cpu().detach().numpy(), 
-                                                y_preds.cpu().detach().numpy())
-        #cf_matrix2= confusion_matrix(y_trues.argmax(axis=1).cpu().detach().numpy(), 
-        #                            y_preds.argmax(axis=1).cpu().detach().numpy())
-        #print(cf_matrix2)
+        cf_matrix = confusion_matrix(y_trues.cpu().detach().numpy(), y_preds.cpu().detach().numpy())
         fscores = np.zeros(bin)
         accuracy = np.zeros(bin)
         missrate = np.zeros(bin)
-
+        precision = np.zeros(bin)
+        recall = np.zeros(bin)
         for i in range(bin):
             TP = cf_matrix[i,1,1]
             FP = cf_matrix[i,0,1]
@@ -45,15 +47,11 @@ def my_confusion_matrix(y_trues, y_preds, bin):
             else:
                 fscores[i] = 0
             accuracy[i] = (TP+TN)/(TP+TN+FN+FP)
+            recall[i] = TP / (TP+FP)
+            precision[i] = TP / (TP+FP)
             missrate[i] = FN / (FN+TP)
-    macro_fscore = f1_score(y_trues.cpu().detach().numpy(), 
-                            y_preds.cpu().detach().numpy(), average='macro', zero_division=0)
-    micro_fscore = f1_score(y_trues.cpu().detach().numpy(), 
-                            y_preds.cpu().detach().numpy(), average='micro', zero_division=0)
-    _, recall, _, _ = score(y_trues.cpu().detach().numpy(), 
-                            y_preds.cpu().detach().numpy(),zero_division=0)
     
-    return micro_fscore, macro_fscore, recall, accuracy, fscores, missrate, cf_matrix
+    return accuracy, fscores, missrate, cf_matrix, precision, recall
 
 
 def plot_embeddings(embeddings, labels, layers, epoch, writer):
@@ -81,23 +79,18 @@ def plot_embeddings(embeddings, labels, layers, epoch, writer):
             ax[i].set_ylabel("Frame (time-axis)")
         fig.tight_layout()
         writer.add_figure(f'w2v2-layers/{j}/{lab}_{epoch}', fig, global_step=epoch)
-        #plt.savefig(f"/LibriStutter_data/features/{epoch}_{label.item()[-1]}_{n}.jpg")
 
-def compute_TSNE(embeddings, labels, stage, epoch, num_class, writer):
+
+        #plt.savefig(f"/LibriStutter_data/features/{epoch}_{label.item()[-1]}_{n}.jpg")
+def compute_TSNE(embeddings, labels, stage, writer):
     if (embeddings.dim()==3):
         x_train = embeddings.reshape([embeddings.shape[0],embeddings.shape[1]*embeddings.shape[2]])
     else:
         x_train = embeddings.reshape([embeddings.shape[0],embeddings.shape[1]])
-    #x_mnist = reshape(x_train, [x_train.shape[0], x_train.shape[1]* x_train.shape[2]])
-
-    y_labels = labels.detach().cpu().numpy()
-    if(num_class == 1):
-        y_train = ["fluent" if x == 1 else "disfluent" for x in y_labels[:,:,0] ]
-    else:
-        y_train = [str(x) for x in y_labels]
-    tsne = TSNE(n_components=2, perplexity=10, verbose=0, n_iter=50000, random_state=2)
-    z = tsne.fit_transform(x_train.detach().cpu().numpy())
-
+    y_train = labels
+    tsne = TSNE(n_components=2, perplexity=5)
+    oncpu = x_train.detach().cpu().numpy()
+    z = tsne.fit_transform(oncpu)
     df = pd.DataFrame()
     df["label"] = y_train
     df["x"] = z[:,0]
@@ -107,9 +100,6 @@ def compute_TSNE(embeddings, labels, stage, epoch, num_class, writer):
     fig, ax = plt.subplots()
     scatter = ax.scatter(df["x"], df["y"], c=df['colors'])
     handles = scatter.legend_elements(num=[0,1,2,3])[0]
-    legend = ax.legend(#*scatter.legend_elements(),
-                    handles = handles,
-                    loc="lower left", title="Classes", labels=group_codes.keys())
+    legend = ax.legend(handles = handles, labels=group_codes.keys())
     ax.add_artist(legend)
-    writer.add_figure(f"TSNE/{stage}", plt.gcf(), epoch)
-    plt.clf()
+    writer.add_figure(f"TSNE/{stage}", plt.gcf())
