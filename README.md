@@ -1,1 +1,1 @@
-The README and the content of this repository is still Work In Progress.
+The README and the content of this repository are still Work In Progress.
