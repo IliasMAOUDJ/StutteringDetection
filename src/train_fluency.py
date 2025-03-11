@@ -6,9 +6,11 @@ from torch.utils.tensorboard import SummaryWriter
 import sys
 import torch
 import speechbrain as sb
+from speechbrain.utils.epoch_loop import EpochCounterWithStopper
 from hyperpyyaml import load_hyperpyyaml
 import model.utils
 import model.features
+from model.Sheikh import Sheikh2022
 import torchaudio
 import numpy as np
 from data_prep_utils import *
@@ -21,11 +23,10 @@ class LatimBrain(sb.Brain):
     def compute_feats(self, wavs, lens, stage):
         if(self.hparams.nr):
             with torch.no_grad():
-                wavs = self.hparams.noisereducer(wavs)
+                wavs, lens = self.hparams.noisereducer(wavs)
         if stage == sb.Stage.TRAIN:
             if(self.hparams.augment): 
-                wavs = self.hparams.envcorrupt(wavs, lens)
-                wavs = self.hparams.timedomainaugment(wavs, lens)
+                wavs, lens = self.hparams.augmenter(wavs, lens)
         if(wavs.shape[1]>48000):
             wavs = wavs[:,:48000]
         elif(wavs.shape[1]<48000):
@@ -39,9 +40,13 @@ class LatimBrain(sb.Brain):
 
     def compute_forward(self, batch, stage):
         batch = batch.to(self.device)
+        labels = batch.label.data
         waveforms, lens = batch.waveform
         waveforms = self.compute_feats(waveforms, lens, stage)
-        bin_out = self.modules.model(waveforms)
+        if(isinstance(self.modules.model, Sheikh2022)):
+            bin_out = self.modules.model(waveforms, labels)
+        else:
+            bin_out = self.modules.model(waveforms)
         return {"bin_pred" : bin_out}
                
 
@@ -84,9 +89,9 @@ class LatimBrain(sb.Brain):
             stage_stats["macro"] = self.fscore * 100
             
             if stage == sb.Stage.VALID:
-                self.results = stage_stats
                 self.stage_loss = stage_loss
-                
+                if(isinstance(self.hparams.counter,EpochCounterWithStopper)):
+                    self.hparams.counter.update_metric(stage_loss)
                 if self.hparams.ckpt_enable:
                     self.checkpointer.save_and_keep_only(
                         meta=stage_stats, min_keys=["loss"], keep_recent=False, name=f"ckpt_{epoch}"
@@ -112,6 +117,7 @@ class LatimBrain(sb.Brain):
                     model.utils.compute_TSNE(self.embeddings, self.labels, "best_epoch", epoch, num_class=self.hparams.num_class, writer=writer)
                 """
             elif stage == sb.Stage.TEST:
+                self.results = stage_stats
                 self.hparams.train_logger.log_stats(
                     stats_meta={"Epoch loaded": self.hparams.counter.current},
                     test_stats=stage_stats,
@@ -146,10 +152,16 @@ def dataio_prep(hparams):
         waveform, _ = torchaudio.load(file, normalize=True)
         audio = waveform
         return (EpId, int(ClipId)), audio.squeeze()
-    @sb.utils.data_pipeline.takes("Prolongation", "Block", "SoundRep", "WordRep", "Interjection", "NoStutteredWords")
+    @sb.utils.data_pipeline.takes("Prolongation", "Block", "SoundRep", "WordRep", "Interjection", "Unsure", "DifficultToUnderstand", "PoorAudioQuality","NoStutteredWords")
     @sb.utils.data_pipeline.provides("label", "disfluency")
-    def get_label(p, b, sr, wr, inter, f):
-        label, disfluency = get_labels(p,b,sr,wr,inter,f)
+    def get_label(p, b, sr, wr, inter,unsure, difficultToUnderstand, poor, f):
+        label, disfluency = get_labels(p,b,sr,wr,inter, unsure, difficultToUnderstand, poor,f)
+        return label, disfluency
+
+    @sb.utils.data_pipeline.takes("Prolongation", "Block", "SoundRep", "WordRep", "Interjection", "Unsure", "DifficultToUnderstand", "PoorAudioQuality","NoStutteredWords")
+    @sb.utils.data_pipeline.provides("label", "disfluency")
+    def get_label_test(p, b, sr, wr, inter,unsure, difficultToUnderstand, poor, f):
+        label, disfluency = get_labels(p,b,sr,wr,inter, unsure, difficultToUnderstand, poor,f, "test")
         return label, disfluency
 
     datasets={}
@@ -157,133 +169,150 @@ def dataio_prep(hparams):
         print(f"----------- Processing {dataset} ------------------------")
         csv_path = None
         if dataset=="train" or dataset =="valid":
-            if hparams["train_set"] == "sep28k":
-                csv_path=f'/data/csv/SEP28k-E_{dataset}.csv'
+            if hparams["train_set"] == "sep28k-E":
+                csv_path=f'/data/csv/sep28k-E/SEP28k-E_{dataset}.csv'
+            elif hparams["train_set"] == "random":
+                csv_path=f'/data/csv/sep28k/sep28k_annotation_{dataset}_{hparams["fold"]}.csv'
             elif hparams["train_set"] == "fluencybank":
-                csv_path=f'/data/csv/fluencybank_{dataset}.csv'
-
-            if hparams["train_set"] == "syn":
-                tmp = data_prep_utils.dataio_prep(hparams)
-                datasets[f"{dataset}"] = tmp[f"{dataset}"]
-        else:
-            if hparams["test_set"] == "sep28k":
-                csv_path=f'/data/csv/SEP28k-E_{dataset}.csv'
-            elif hparams["test_set"] == "fluencybank":
-                csv_path=f'/data/csv/fluencybank_{dataset}.csv'
-        if(csv_path is not None):
+                csv_path=f'/data/csv/fluencybank/fluencybank_{dataset}.csv'
             datasets[f"{dataset}"] = sb.dataio.dataset.DynamicItemDataset.from_csv(
                 csv_path=csv_path,
                 dynamic_items=[audio_pipeline, get_label],
-                output_keys=["id", "waveform", "label", "disfluency"],
-            )
-
-            
-        if(hparams["remove_unsure"]):
-            counter_u =0
-            for i in range(len(datasets[dataset])):
-                    if(datasets[dataset][i]["disfluency"]==-1):
-                        counter_u +=1
-            d = datasets[dataset].filtered_sorted(sort_key="disfluency", reverse=True, select_n=len(datasets[dataset])-counter_u)
-            datasets[dataset] = d
+                output_keys=["id", "waveform", "label", "disfluency"])
+        else:
+            if hparams["test_set"] == "sep28k-E":
+                csv_path=f'/data/csv/sep28k-E/SEP28k-E_{dataset}.csv'
+            elif hparams["test_set"] == "random":
+                csv_path=f'/data/csv/sep28k/sep28k_annotation_{dataset}_{hparams["fold"]}.csv'
+            elif hparams["test_set"] == "fluencybank":
+                csv_path=f'/data/csv/fluencybank/fluencybank_{dataset}.csv'
+            datasets["test"] = sb.dataio.dataset.DynamicItemDataset.from_csv(
+                csv_path=csv_path,
+                dynamic_items=[audio_pipeline, get_label_test],
+                output_keys=["id", "waveform", "label", "disfluency"])
         
-        if(dataset=="train" or hparams["balance_test"]):
-            if(hparams["balance"] or hparams["balance_test"]):
-                counter_1 =0
-                #count number of positive samples
-                for i in range(len(datasets[dataset])):
-                    if(datasets[dataset][i]["disfluency"]==1):
-                        counter_1 +=1
-                d = datasets[dataset].filtered_sorted(sort_key="disfluency", reverse=True, select_n=None)
-                count = 0
-                new_data = {}
-                #keep all postive samples
-                for key in d:
-                    if count < counter_1:
-                        id = key["id"]
-                        key.pop("id")
-                        new_key = key
-                        new_data[id] = new_key
-                        count+=1
+        
+        
 
-                total_samples = min((1/hparams["balance_ratio"])*counter_1, len(d))
-                #while current_nb_samples < ratio * positive_samples
-                while count < total_samples :
-                    x = random.choice(datasets[dataset])
-                    if x["id"] not in new_data.keys() and x["disfluency"]==0:
-                        id = x["id"]
-                        x.pop("id")
-                        new_key = x
-                        new_data[id] = new_key
-                        count+=1
+        if(hparams["remove_unsure"] or dataset =="test"):
+            d = datasets[dataset].filtered_sorted(key_min_value={"disfluency":0})
+            datasets[dataset] = d
 
-                @sb.utils.data_pipeline.takes("label")
-                @sb.utils.data_pipeline.provides("label")
-                def label2label(label):
-                    return label
-                @sb.utils.data_pipeline.takes("waveform")
-                @sb.utils.data_pipeline.provides("waveform")
-                def wav2wav(wav):
-                    return wav
-                new_set = sb.dataio.dataset.DynamicItemDataset(new_data,  dynamic_items=[wav2wav, label2label],
-                                                                        output_keys=["id", "waveform", "label"],)
-                datasets[dataset] = new_set
+        if(not dataset=="test" and hparams["balance"]):
+            hparams["positive"] = (1/hparams["balance_ratio"])-1
+            counter_1 =0
+            #count number of positive samples
+            for i in range(len(datasets[dataset])):
+                if(datasets[dataset][i]["disfluency"]==1):
+                    counter_1+=1
+            d = datasets[dataset].filtered_sorted(sort_key="disfluency", reverse=True, select_n=None)
+
+            count = 0
+            new_data = {}
+            #keep all postive samples
+            for key in d:
+                if count < counter_1:
+                    id = key["id"]
+                    key.pop("id")
+                    new_key = key
+                    new_data[id] = new_key
+                    count+=1
+            total_samples = min((1/hparams["balance_ratio"])*counter_1, len(d))
+            #while current_nb_samples < ratio * positive_samples
+            while count < total_samples :
+                x = random.choice(datasets[dataset])
+                if x["id"] not in new_data.keys() and x["disfluency"]!=1:
+                    id = x["id"]
+                    x.pop("id")
+                    new_key = x
+                    new_data[id] = new_key
+                    count+=1
+            @sb.utils.data_pipeline.takes("label")
+            @sb.utils.data_pipeline.provides("label")
+            def label2label(label):
+                return label
+            @sb.utils.data_pipeline.takes("waveform")
+            @sb.utils.data_pipeline.provides("waveform")
+            def wav2wav(wav):
+                return wav
+            new_set = sb.dataio.dataset.DynamicItemDataset(new_data,  dynamic_items=[wav2wav, label2label],
+                                                                    output_keys=["id", "waveform", "label"],)
+            datasets[dataset] = new_set
+
+        if(dataset == "train"):
+            d_fluent = datasets[dataset].filtered_sorted(key_min_value={"label":0},key_max_value={"label":0})
+            d_disfluent = datasets[dataset].filtered_sorted(key_min_value={"label":1},key_max_value={"label":1})
+            hparams["positive"] = len(d_fluent)/len(d_disfluent)
+            print(f"There are {len(d_disfluent)} {hparams['stutter']} samples, therefore positive_weight is set to {hparams['positive']}.")
+        print(f"The set includes {len(datasets[dataset])} samples.")
     return datasets
-def get_labels(p,b,sr,wr,inter, f):
-    label = torch.zeros(6)
-    out = torch.zeros(2)
-    if(hparams["annot_value"]==3):
-        labels = torch.tensor([int(f),int(inter),int(sr),int(wr),int(p),int(b)])
-        if(hparams["SoundRep"]):
-            #int(sr)>=hparams["annot_value"] and 
-            #label[CLASSES.index("SoundRep")] = 1
-            label[2] =1
-        if(hparams["WordRep"]):
-            #int(wr)>=hparams["annot_value"] and 
-            #label[CLASSES.index("WordRep")] = 1
-            label[3] =1
-        if(hparams["Prolongation"]):
-            #int(p)>=hparams["annot_value"] and 
-            #label[CLASSES.index("Prolongation")] = 1
-            label[4] =1
-        if(hparams["Block"]):
-            #int(b)>=hparams["annot_value"] and 
-            #label[CLASSES.index("Block")] = 1
-            label[5] =1
-        if(hparams["Interjection"]):
-            #int(inter)>=hparams["annot_value"]
-            #label[CLASSES.index("Interjection")] = 1
-            label[1]=1
-        if(f==3):
-            label[0]=1
-        final = label * labels
-        if(torch.count_nonzero(final)>=1):   
-            if(torch.nonzero(final)[0]==0):
-                out[0] = 1
-                disfluency = 0
+
+
+
+def get_labels(p,b,sr,wr,inter, unsure, difficultToUnderstand, poor, f, dataset="train"):
+    active_label = torch.zeros(6)
+    out = torch.zeros(1)
+
+    labels = torch.tensor([int(f),int(inter),int(sr),int(wr),int(p),int(b)])
+    if(hparams[f"annot_value_{dataset}"]==3):
+        #Which labels are considered ?
+        if(hparams["stutter"]=="Interjection"):
+            active_label[1]=1
+        if(hparams["stutter"]=="SoundRep"):
+            active_label[2] =1
+        if(hparams["stutter"]=="WordRep"):
+            active_label[3] =1
+        if(hparams["stutter"]=="Prolongation"):
+            active_label[4] =1
+        if(hparams["stutter"]=="Block"):
+            active_label[5] =1
+        #Fluency class is always considered
+        active_label[0]=1
+        # Which labels are considered combined with labels to output only the labels we are interested in
+        final = active_label * labels
+        final = torch.where(final==3, 3, 0)
+        if(torch.count_nonzero(final)==1):   
+            if(final[0]==3):
+                disfluency = 0 #fluent speech
             else:
-                out[1] = 1
-                disfluency = 1
+                out[0] = 1
+                disfluency = 1 #disfluent speech
         else:
-            disfluency= -1
-    elif(hparams["annot_value"]==2):
-        if(int(sr)>=hparams["annot_value"] and hparams["stutter"]=="SoundRep"):
-            label[2] =1
-        if(int(wr)>=hparams["annot_value"] and hparams["stutter"]=="WordRep"):
-            label[3] =1
-        if(int(p)>=hparams["annot_value"] and hparams["stutter"]=="Prolongation"):
-            label[4] =1
-        if(int(b)>=hparams["annot_value"] and hparams["stutter"]=="Block"):
-            label[5] =1
-        if(int(inter)>=hparams["annot_value"] and hparams["stutter"]=="Interjection"):
-            label[1] = 1
-        if(torch.count_nonzero(label)==0):
-            out[0]=1
+            disfluency= -1 #unsure
+    else:
+        if(int(sr)>=hparams[f"annot_value_{dataset}"] and hparams["stutter"]=="SoundRep"):
+            active_label[2] =1
+        if(int(wr)>=hparams[f"annot_value_{dataset}"] and hparams["stutter"]=="WordRep"):
+            active_label[3] =1
+        if(int(p)>=hparams[f"annot_value_{dataset}"] and hparams["stutter"]=="Prolongation"):
+            active_label[4] =1
+        if(int(b)>=hparams[f"annot_value_{dataset}"] and hparams["stutter"]=="Block"):
+            active_label[5] =1
+        if(int(inter)>=hparams[f"annot_value_{dataset}"] and hparams["stutter"]=="Interjection"):
+            active_label[1] = 1
+
+
+        #if(torch.any(active_label[1:]>=1) and int(f)>=hparams[f"annot_value_{dataset}"]):
+            #sample is both "fluent" and "disfluent"
+            #out[0] = 1
+            #disfluency = -2
+        if(torch.all(labels<hparams[f"annot_value_{dataset}"])):
+            # is neither
+            disfluency = -2
+        elif(torch.count_nonzero(active_label)==0):
             disfluency = 0
-        else:
-            out[1]=1
+        elif(torch.count_nonzero(active_label)>0): #and int(f)<hparams[f"annot_value_{dataset}"]
+            out[0]=1
             disfluency = 1
-    if(hparams["num_class"]==1):
-        out = out[1:]
+
+        else:
+            #Should never be reached but just in case
+            print(active_label)
+            print(labels)
+            print('UNKNOWN PROCESSING')
+
+    if(disfluency >=0 and (int(unsure)>0 or int(difficultToUnderstand)>0 or int(poor)>0)):
+        disfluency=-1
     return out, disfluency
     
 import os
@@ -291,7 +320,6 @@ import data_prep_utils
 from termcolor import colored, cprint
 from speechbrain.utils import hpopt as hp
 import csv
-from speechbrain.utils import checkpoints as ckpt
 if __name__ == "__main__":
     # Load hyperparameters file with command-line overrides
     with hp.hyperparameter_optimization(objective_key="loss") as hp_ctx: # <-- Initialize the context
@@ -300,17 +328,19 @@ if __name__ == "__main__":
             hparams = load_hyperpyyaml(fin, overrides)
             try:
                 hparams["output_folder"] = hparams["output_folder"]+hp.get_trial_id()
-                writer = SummaryWriter("/tensorboard")
+                print("USING ORION TO OPTIMIZE")
             except:
-                writer = SummaryWriter(hparams["output_folder"]+"/tensorboard")
+                print("NOT USING ORION")
+    
+            writer = SummaryWriter(hparams["output_folder"]+"/tensorboard")
         print("*********************************************************************")
-        cprint(f"Model architecture used is ", end='')
-        cprint(colored(hparams['models'],'red', attrs=["bold"]))
 
         print(colored(overrides, 'green'))
-        CLASSES = ["Fluent"]
+        CLASSES = []
         CLASSES.append(hparams["stutter"])
         print(CLASSES)
+        cprint(f"Model architecture used is ", end='')
+        print(colored(hparams['models'], 'red'))
         print("*********************************************************************")
         
         # Create experiment directory
@@ -372,6 +402,7 @@ if __name__ == "__main__":
                             'best_score': detect_brain.best_fscore
                             })
         
+        print(detect_brain.results)
         hp.report_result(detect_brain.results)
         with open(f'{hparams["output_folder"]}/orion.csv', 'w') as csv_file:  
             wr = csv.writer(csv_file)

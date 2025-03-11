@@ -8,6 +8,7 @@ import sys
 import torch
 import speechbrain as sb
 from hyperpyyaml import load_hyperpyyaml
+from speechbrain.utils.epoch_loop import EpochCounterWithStopper
 import model.utils
 import torchaudio
 import pandas as pd
@@ -23,24 +24,10 @@ class LatimBrain(sb.Brain):
     def compute_feats(self, wavs, lens, stage):
         if(self.hparams.nr):
             with torch.no_grad():
-                wavs = self.hparams.noisereducer(wavs)
-        #if(self.hparams.preaugment):
-        #        #wavs = self.hparams.preaugment(wavs, lens)
-        #    mywavs = np.empty_like(wavs.cpu())
-        #    for i in range(wavs.shape[0]):
-        #        wav = nr.reduce_noise(y=wavs[i].cpu(), sr=16000, time_constant_s=1.5, use_torch=True, device="cuda:0")
-        #        mywavs[i]= wav
-        #    wavs = torch.tensor(mywavs).to("cuda:0")
-        #feats = self.hparams.compute_feats(wavs)
+                wavs = self.modules.noisereducer(wavs)
         if stage == sb.Stage.TRAIN:
-            if(self.hparams.augment): 
-                wavs = self.hparams.envcorrupt(wavs, lens)
-                wavs = self.hparams.timedomainaugment(wavs, lens)
-                
-            if(self.hparams.normalize):
-                #feats = (feats - self.hparams.dataset_mean) / (self.hparams.dataset_std)
-                wavs = self.hparams.normalizer(wavs, lens, epoch=self.hparams.counter.current)
-
+            if(self.hparams.augment):
+                wavs, lens = self.hparams.augmenter(wavs, lens)
         if(wavs.shape[1]>48000):
             wavs = wavs[:,:48000]
         elif(wavs.shape[1]<48000):
@@ -54,14 +41,10 @@ class LatimBrain(sb.Brain):
         waveforms = self.compute_feats(waveforms, lens, stage)
         bin_out = self.modules.model(waveforms)
         return {"bin_pred" : bin_out}
-        
-        #bin_pred = self.modules.bin_classifier(embeddings)
-        #return {"bin_pred" : bin_pred,
-        #        "embeddings": embeddings} # = predictions
 
     def compute_objectives(self, predictions, batch, stage):
         labels = batch.label.data
-        #ids = torch.tensor([int(x) for x in batch.id]).to("cuda:0")
+        ids = torch.tensor([int(x) for x in batch.id]).to("cuda:0")
         binary_labels = torch.tensor(()).to("cuda:0")
         for label in labels:
             if(torch.count_nonzero(label)==0):
@@ -80,7 +63,7 @@ class LatimBrain(sb.Brain):
         binary_loss = sb.nnet.losses.bce_loss(predictions["bin_pred"].float(), binary_labels.float(), pos_weight=torch.Tensor([self.hparams.positive]).to("cuda:0"))
         
         binary_preds = torch.sigmoid(predictions["bin_pred"]) #torch.argmax(, axis=1)
-        #self.all_ids = torch.cat((self.all_ids,ids))
+        self.all_ids = torch.cat((self.all_ids,ids))
         self.y_true_binary = torch.cat((self.y_true_binary,binary_labels))
         self.y_preds_binary = torch.cat((self.y_preds_binary,binary_preds))
         return binary_loss
@@ -109,8 +92,10 @@ class LatimBrain(sb.Brain):
             stage_stats["rev_macro"] = 100 - self.fscore *100
             
             if stage == sb.Stage.VALID:
+                if(isinstance(self.hparams.counter,EpochCounterWithStopper)):
+                    self.hparams.counter.update_metric(stage_loss)
                 self.stage_loss = stage_loss
-                if(stage_loss < self.best_loss or self.fscore > self.best_fscore):
+                if(stage_loss < self.best_loss):# or self.fscore > self.best_fscore):
                     self.min_loss = stage_loss
                     self.best_matrix = self.cf_matrix
                     self.best_precision = self.prec
@@ -121,7 +106,7 @@ class LatimBrain(sb.Brain):
                 
                 if self.hparams.ckpt_enable:
                     self.checkpointer.save_and_keep_only(
-                        meta=stage_stats, max_keys=["macro"], keep_recent=False, num_to_keep=1, name=f"ckpt_{epoch}"
+                        meta=stage_stats, min_keys=["loss"], keep_recent=False, num_to_keep=1, name=f"ckpt_{epoch}"
                     )
                 self.hparams.train_logger.log_stats(
                     stats_meta={"epoch": epoch},
@@ -169,6 +154,8 @@ class LatimBrain(sb.Brain):
                     self.test_fscore_loss = self.fscore
                 if(CURRENT=="macro"):
                     self.test_fscore_macro = self.fscore
+                    self.test_precision = self.prec
+                    self.test_recall = self.recall
                 self.results = stage_stats
                 with open(f'{hparams["save_folder"]}/orion.csv', 'a') as csv_file:  
                     wr = csv.writer(csv_file)
@@ -182,7 +169,6 @@ class LatimBrain(sb.Brain):
         curr_stage = stage.name.split('.')[-1].lower()
         print(f"******{curr_stage}******")
         if stage == sb.Stage.TEST:
-            """
             file_exists = os.path.isfile(f'{hparams["output_folder"]}/predictions_{CURRENT}.csv')
             tracks, indices = annotationToTrial(self.all_ids)
             with open(f'{hparams["output_folder"]}/predictions_{CURRENT}.csv', 'a') as csv_file:  
@@ -209,7 +195,7 @@ class LatimBrain(sb.Brain):
                 wr.writerow(["ID", "TP", "TN", "FP", "FN"])
                 for trial in trials:
                     wr.writerow([trial, tps[trial], tns[trial], fps[trial], fns[trial]])
-                """
+                
         self.accuracy, self.fscore, self.missrate, self.cf_matrix, self.prec, self.recall= model.utils.my_confusion_matrix(self.y_true_binary, self.y_preds_binary, bin=0)
         print(self.cf_matrix)
         self.hparams.train_logger.log_stats(stats_meta={"F1-score": np.round(self.fscore,4)})
@@ -217,9 +203,10 @@ class LatimBrain(sb.Brain):
 def annotationToTrial(ids):
     if("iemas" in {hparams["test_set"]} or "scot" in {hparams["test_set"]} or "hscot" in {hparams["test_set"]}):
         dataset = "iemas"
+        annotations = f"/data/csv/iemas/annotation.csv"
     else:
         dataset = "databrase"
-    annotations = f"/data/{dataset}/annotation.csv"
+        annotations = f"/data/csv/databrase/annotation.csv"
     df = pd.read_csv(annotations)
     tracks = []
     indices = []
@@ -240,7 +227,7 @@ def dataio_prep(hparams):
     @sb.utils.data_pipeline.takes("record","clipID")
     @sb.utils.data_pipeline.provides("id", "waveform")
     def french_audio_pipeline(record,clipID):
-        file = f"/data/databrase/Clips/{record}_{clipID}.wav"
+        file = f"/data/csv/databrase/Clips/{record}_{clipID}.wav"
         waveform, _ = torchaudio.load(file, normalize=True)
         audio = waveform
         return int(clipID), audio.squeeze()
@@ -287,9 +274,6 @@ def dataio_prep(hparams):
     fold = hparams["fold"]
     for dataset in ["train", "valid", "test"]:
         print(f"----------- Processing {dataset} ------------------------")
-
-
-
         @sb.utils.data_pipeline.takes("waveform", "label", "disfluency", "origin")
         @sb.utils.data_pipeline.provides("waveform", "label", "disfluency", "origin")
         def copy(waveform, label, disfluency, origin):
@@ -298,18 +282,18 @@ def dataio_prep(hparams):
             csv_path = None
             if hparams["train_set"] == "iemas" and hparams["test_set"] == "databrase":
                 if(dataset =="train"):
-                    csv_path=f'/data/csv/annotation_train.csv'
+                    csv_path=f'/data/csv/iemas/annotation_train.csv'
                 else:
-                    csv_path=f'/data/csv/annotation_test.csv'
+                    csv_path=f'/data/csv/iemas/annotation_test.csv'
             elif(hparams["train_set"]=="scot" or hparams["train_set"]=="hscot"):
                 csv_path=f'/data/csv/{hparams["train_set"]}_annotation_{dataset}_all.csv'
             elif(hparams["train_set"]=="iemas"):
                 if(hparams["subset"] =="all"):
-                    csv_path=f'/data/csv/annotation_{dataset}_{fold}.csv'
+                    csv_path=f'/data/csv/iemas/annotation_{dataset}_{fold}.csv'
                 elif(hparams["subset"]=="random"):
-                    csv_path=f'/data/csv/random_annotation_{dataset}_{fold}.csv'
+                    csv_path=f'/data/csv/iemas_random/random_annotation_{dataset}_{fold}.csv'
                 elif(hparams["subset"]=="scot" or hparams["subset"]=="hscot"):
-                    csv_path=f'/data/csv/{hparams["subset"]}_annotation_{dataset}_{fold}.csv'
+                    csv_path=f'/data/csv/{hparams["subset"]}/{hparams["subset"]}_annotation_{dataset}_{fold}.csv'
             if(csv_path is not None):
                 datasets[f"{dataset}"] = sb.dataio.dataset.DynamicItemDataset.from_csv(
                                         csv_path=csv_path,
@@ -325,13 +309,13 @@ def dataio_prep(hparams):
                 #tmp = data_prep_utils.dataio_prep(hparams)
                 #datasets[f"{dataset}"] = tmp[f"{dataset}"]
             if("iemas" in hparams["train_set"] and "databrase" in hparams["train_set"]):
-                csv_path=f'/data/csv/annotation_{dataset}_{fold}.csv'
+                csv_path=f'/data/csv/iemas/annotation_{dataset}_{fold}.csv'
                 iemas = sb.dataio.dataset.DynamicItemDataset.from_csv(
                                             csv_path=csv_path,
                                             dynamic_items=[iemas_audio_pipeline, iemas_get_label],
                                             output_keys=["id", "waveform", "label", "disfluency", "origin"])
                 
-                csv_path=f'/data/databrase/annotation.csv'
+                csv_path=f'/data/csv/databrase/annotation.csv'
                 databrase = sb.dataio.dataset.DynamicItemDataset.from_csv(
                                             csv_path=csv_path,
                                             dynamic_items=[french_audio_pipeline, our_get_label],
@@ -354,20 +338,20 @@ def dataio_prep(hparams):
         else:
             if hparams["test_set"] == "syn":
                 datasets[f"{dataset}"] = sb.dataio.dataset.DynamicItemDataset.from_csv(
-                                        csv_path=f'/data/csv/{dataset}_syn.csv',
+                                        csv_path=f'/data/csv/iemas/{dataset}_syn.csv',
                                         dynamic_items=[synthetic_audio_pipeline, synthetic_get_label],
                                         output_keys=["id", "waveform", "label", "disfluency", "origin"],
                                         )
                 #tmp = data_prep_utils.dataio_prep(hparams)
                 #datasets[f"{dataset}"] = tmp[f"{dataset}"]
             elif("iemas" in hparams["test_set"] and "databrase" in hparams["test_set"]):
-                csv_path=f'/data/csv/annotation_{dataset}_{fold}.csv'
+                csv_path=f'/data/csv/iemas/annotation_{dataset}_{fold}.csv'
                 iemas = sb.dataio.dataset.DynamicItemDataset.from_csv(
                                             csv_path=csv_path,
                                             dynamic_items=[iemas_audio_pipeline, iemas_get_label],
                                             output_keys=["id", "waveform", "label", "disfluency", "origin"])
                 
-                csv_path=f'/data/databrase/annotation_{dataset}.csv'
+                csv_path=f'/data/csv/databrase/annotation_{dataset}.csv'
                 databrase = sb.dataio.dataset.DynamicItemDataset.from_csv(
                                             csv_path=csv_path,
                                             dynamic_items=[french_audio_pipeline, our_get_label],
@@ -389,21 +373,21 @@ def dataio_prep(hparams):
                                                                 output_keys=["id", "waveform", "label", "disfluency", "origin"])
             else:
                 if(hparams["test_set"]=="scot"):
-                        csv_path=f'/data/csv/scot_annotation_all.csv'
+                        csv_path=f'/data/csv/scot/scot_annotation_all.csv'
                 elif(hparams["test_set"]=="hscot"):
-                        csv_path=f'/data/csv/hscot_annotation_all.csv'
+                        csv_path=f'/data/csv/hscot/hscot_annotation_all.csv'
                 elif hparams["train_set"]!= hparams["test_set"] and hparams["test_set"]=="databrase":
                     if hparams["test_set"] == "databrase":
-                        csv_path = '/data/databrase/annotation.csv'
+                        csv_path = '/data/csv/databrase/annotation.csv'
                 else:
                     if(hparams["subset"]=="scot"):
-                        csv_path=f'/data/csv/scot_annotation_test_{fold}.csv'
+                        csv_path=f'/data/csv/scot/scot_annotation_test_{fold}.csv'
                     elif(hparams["subset"]=="hscot"):
-                        csv_path=f'/data/csv/hscot_annotation_test_{fold}.csv'
+                        csv_path=f'/data/csv/hscot/hscot_annotation_test_{fold}.csv'
                     elif(hparams["subset"]=="random"):
-                        csv_path=f'/data/csv/random_annotation_{dataset}_{fold}.csv'
+                        csv_path=f'/data/csv/iemas_random/random_annotation_{dataset}_{fold}.csv'
                     else:
-                        csv_path = f'/data/{hparams["test_set"]}/annotation_test_{fold}.csv'
+                        csv_path = f'/data/csv/iemas/annotation_test_{fold}.csv'
                     
                 if(hparams["test_set"] == "databrase"):
                     audio_func, label_func =  french_audio_pipeline, our_get_label
@@ -482,7 +466,11 @@ def dataio_prep(hparams):
                 if(datasets[dataset][i]["label"]==1):
                     syn_cnt_pos+=1
 
-
+        if(dataset == "train"):
+            d_fluent = datasets[dataset].filtered_sorted(key_max_value={"label":0})
+            d_disfluent = datasets[dataset].filtered_sorted(key_min_value={"label":1})
+            hparams["positive"] = len(d_fluent)/len(d_disfluent)
+            print(f"Ratio of negative over positive in train set is set to {hparams['positive']}")
         print(f"Number of samples from Databrase: {databr_cnt} with {databr_cnt_pos} positives.")
         print(f"Number of samples from IEMAS: {iemas_cnt} with {iemas_cnt_pos} positives")
         print(f"Number of samples from SYNTHETIC: {syn_cnt} with {syn_cnt_pos} positives")
@@ -498,7 +486,7 @@ from collections import Counter
 from speechbrain.utils import checkpoints as ckpt
 if __name__ == "__main__":
     # Load hyperparameters file with command-line overrides
-    with hp.hyperparameter_optimization(objective_key="rev_macro") as hp_ctx: # <-- Initialize the context
+    with hp.hyperparameter_optimization(objective_key="loss") as hp_ctx: # <-- Initialize the context
         hparams_file, run_opts, overrides = hp_ctx.parse_arguments(sys.argv[1:]) # <-- Replace sb with hp_ctx
         with open(hparams_file) as fin:
             hparams = load_hyperpyyaml(fin, overrides)
@@ -515,7 +503,7 @@ if __name__ == "__main__":
 
         print(colored(overrides, 'green'))
         
-        hparams["train_logger"].log_stats(stats_meta={"model": hparams["model"]})
+        hparams["train_logger"].log_stats(stats_meta={"model": hparams["models"]})
         print("*********************************************************************")
         
         # Create experiment directory
@@ -565,14 +553,15 @@ if __name__ == "__main__":
                                                                                    # num_class=hparams["num_class"])
         detect_brain.evaluate(
             datasets[f"test"],
-            max_key="macro",
+            min_key="loss",
             test_loader_kwargs=hparams["dataloader_opts"],
         )
 
         writer.add_hparams(overrides,
                            {
-                            'score/F1-macro': detect_brain.test_fscore_macro,
-                            'best_score': detect_brain.best_fscore
+                            'F1-score': detect_brain.test_fscore_macro,
+                            'Recall': detect_brain.test_recall,
+                            'Precision': detect_brain.test_precision
                             })
 
         hp.report_result(detect_brain.results)

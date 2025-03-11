@@ -2,43 +2,26 @@
 import torch
 from torch import nn
 import timm
-import numpy as np
 import speechbrain as sb
-from noisereduce.torchgate import TorchGate as TG
 import logging
 logger = logging.getLogger(__name__)
-
+from model.models_utils import PatchEmbed
 from huggingface_hub.hf_api import HfFolder
-#import speechbrain.lobes.models.huggingface_transformers.whisper
 HfFolder.save_token("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")
+from speechbrain.lobes.models import huggingface_transformers
 
-class NoiseReduction(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.tg = TG(sr=16000, nonstationary=False).to("cuda:0")
-        
-    def forward(self, x: torch.Tensor):
-        with torch.no_grad():
-            out = self.tg(x)
-        return out
-#----------------------------------------------------------------------------------------------------------
-import torchaudio.pipelines
+
 class MyWav2vec2(nn.Module):
-    def __init__(self,wav2vec2, source, layers, dropout, dropoutlstm, batch_size, hidden_size=256):
+    def __init__(self,wav2vec2, bidirectional):
         super().__init__()
-        self.layers = list(map(int, layers.split(" ")))
-        self.dropout = nn.Dropout(dropout)
         self.relu = nn.LeakyReLU()
-        if("large" in source):
-            embedding_dim = 1024
-        elif("base" in source):
-            embedding_dim = 768
-        
         self.wav2vec2 = wav2vec2
-        self.wav2vec2.output_all_hiddens=True
         self.pooling = sb.nnet.pooling.StatisticsPooling(return_mean=True, return_std=True)
-        self.rnn = sb.nnet.RNN.LSTM(hidden_size, (batch_size,149,2*embedding_dim), num_layers=2, dropout=dropoutlstm, bidirectional=True)
-        self.bin_classifier = ClassificationLayer(hidden_size*149*2, dropout=dropout)
+        self.rnn = sb.nnet.RNN.LSTM(512, (None,149,2*1024), num_layers=2, dropout=0.4, bidirectional=bidirectional)
+        if bidirectional:
+            self.bin_classifier = ClassificationLayer(512*149*2, dropout=0.4)
+        else:
+            self.bin_classifier = ClassificationLayer(512*149, dropout=0.4)
     def forward(self, x: torch.Tensor):
         x = self.wav2vec2(x)
         return self.forward_with_pooling(x)
@@ -56,14 +39,34 @@ class MyWav2vec2(nn.Module):
         return final_bin_out
     
 
+class w2v2(nn.Module):
+    def __init__(self,):
+        super().__init__()
+        self.w2v2 = huggingface_transformers.wav2vec2.Wav2Vec2("facebook/wav2vec2-base-960h",
+                                                                    freeze=False,
+                                                                    freeze_feature_extractor=True,
+                                                                    output_all_hiddens = True,
+                                                                    save_path="./hugging_face")
+        self.fc1 = nn.Sequential(nn.Linear(in_features= 768,out_features=256, bias=True),
+                                 nn.LeakyReLU())
+        self.pooling = sb.nnet.pooling.StatisticsPooling(return_mean=True, return_std=True)
+        self.bin_classifier = ClassificationLayer(256*2, 128,dropout=0.4)
+    def forward(self, x: torch.Tensor):
+        x = self.w2v2(x)[7]
+        out = self.fc1(x)
+        out = self.pooling(out) #.permute(0,2,1)
+        bin_out = self.bin_classifier(out)
+        return bin_out
+    
+
 class ClassificationLayer(nn.Module):
-    def __init__(self, in_dim, dropout):
+    def __init__(self, in_dim, out_dim=1024, dropout=0.2):
         super(ClassificationLayer, self).__init__()
         self.dropout = nn.Dropout(dropout)
         self.bn1 = sb.nnet.normalization.BatchNorm1d(input_size=in_dim)
-        self.bn2 = sb.nnet.normalization.BatchNorm1d(input_size=1024)
-        self.fc1 = nn.Linear(in_features= in_dim, out_features=1024, bias=False)
-        self.fc2 = nn.Linear(1024,1, bias=False)
+        self.bn2 = sb.nnet.normalization.BatchNorm1d(input_size=out_dim)
+        self.fc1 = nn.Linear(in_features= in_dim, out_features=out_dim, bias=True)
+        self.fc2 = nn.Linear(out_dim,1, bias=True)
         self.relu = nn.LeakyReLU()
         
     def forward(self, x):
@@ -78,201 +81,44 @@ class ClassificationLayer(nn.Module):
         return out
 
 
-class JouaitiEtAl(nn.Module):
-    def __init__(self, in_dim, hidden_dim,num_output_channels):
-        super(JouaitiEtAl, self).__init__()
-        self.lstm = sb.nnet.RNN.LSTM(input_size = in_dim, hidden_size = hidden_dim, bidirectional = True, num_layers = 2)
-        self.cyan = nn.Sequential(TimeDistributed(nn.Linear(num_output_channels, num_output_channels//2)),
-                                  nn.ReLU())
-        num_output_channels = num_output_channels//2*47
-        self.red = nn.Sequential(nn.BatchNorm1d(num_output_channels),
-                                nn.Dropout(0.5))
-        self.purple = nn.Sequential(nn.Linear(num_output_channels, num_output_channels//2),
-                                    nn.ReLU(),
-                                    nn.BatchNorm1d(num_output_channels//2),
-                                    nn.Dropout(0.5))
-        self.bin_purple = nn.Sequential(nn.Linear(num_output_channels//2, num_output_channels//4),
-                                    nn.ReLU(),
-                                    nn.BatchNorm1d(num_output_channels//4),
-                                    nn.Dropout(0.5))
-        self.bin_blue = nn.Linear(num_output_channels//4, 1, bias=True)
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.cyan(out)
-        out = torch.flatten(out, 1)
-        out = self.red(out)
-        out = self.purple(out)
-        bin_out = self.bin_purple(out)
-        bin_out = self.bin_blue(bin_out)
-        return bin_out
-
-
-class Lea(nn.Module):
-    def __init__(self):
-        super(Lea, self).__init__()
-        self.lstm = sb.nnet.RNN.LSTM(input_size = 40, hidden_size = 64, bidirectional = False, num_layers = 1)
-        self.clf = ClassificationLayer(301*64,0.2)
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.clf(out)
-        return out
-
-
-# Based on https://github.com/payalmohapatra/Speech-Disfluency-Detection-with-Contextual-Representation-and-Data-Distillation 
-# and https://dl.acm.org/doi/abs/10.1145/3539490.3539601
-class Mohapatra(nn.Module):
-    def __init__(self, size, size2):
-        super(Mohapatra, self).__init__()
-        # in_channels is batch size
-        self.wav2vec2 = sb.lobes.models.huggingface_transformers.wav2vec2.Wav2Vec2("facebook/wav2vec2-base-960h",
-                                                                                 freeze=True,
-                                                                                 freeze_feature_extractor=True,
-                                                                                 save_path="./hugging_face")
+class Whisper(nn.Module):
+    def __init__(self, sb_whisper, features_dim, out_dim,dropout):
+        super(Whisper, self).__init__()
+        self.whisper = sb_whisper
         
-
-        self.layer1 = nn.Sequential(
-            torch.nn.Conv2d(in_channels = 1, out_channels = 8, kernel_size=3, stride=1, padding=1),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool2d(kernel_size=2, stride=2),
-            torch.nn.Dropout(p=0.5)
-        )
-        self.layer1_bn = nn.BatchNorm2d(8)
-        # input size = (batch_size, 8, 74, 384)
-        self.layer2 = nn.Sequential(
-            torch.nn.Conv2d(in_channels = 8, out_channels = 16, kernel_size=3, stride=1, padding=1),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool2d(kernel_size=1, stride=2),
-            torch.nn.Dropout(p=0.5)
-        )
-        self.layer2_bn = nn.BatchNorm2d(16)
-        self.flatten = torch.nn.Flatten()
-        self.fc1 = nn.Linear(16* 37* 192,size, bias=True)
-        self.fc1_bn = nn.BatchNorm1d(size)
-        self.fc2 = nn.Linear(size,size2, bias=True)
-        self.fc2_bn = nn.BatchNorm1d(size2)
-        self.fc3 = nn.Linear(size2,100, bias=True)
-        self.fc3_bn = nn.BatchNorm1d(100)
-        self.fc4 = nn.Linear(100,10, bias=True)
-        self.fc4_bn = nn.BatchNorm1d(10)
-        self.fc5 = nn.Linear(10,1, bias=True)
-
-        self.relu = nn.LeakyReLU()
-    
-    def forward(self, x):
-        x = self.wav2vec2(x)
-        x = x.unsqueeze(1)
-        out = self.layer1(x)
-        out = self.layer2(out)
-        out  = self.flatten(out)
-
-        out = self.fc1(out)
-        out = self.relu(out)
-
-        out = self.fc2(out)
-        out = self.relu(out)
-        out = self.fc3(out)
-        out = self.relu(out)
-
-        out = self.fc4(out)
-        out = self.relu(out)
-
-        out = self.fc5(out)
-        #out = self.sm(out)
-        return out
-
-# Based on https://github.com/filipovvsky/stuttering_detection 
-# and https://www.mdpi.com/2076-3417/13/10/6192
-
-from transformers import AutoFeatureExtractor
-from transformers import AutoModelForAudioClassification
-from model.models_utils import *
-
-class FilipowiczWav(nn.Module):
-    def __init__(self) -> None:
-        super(FilipowiczWav, self).__init__()
-        self.model = AutoModelForAudioClassification.from_pretrained("facebook/wav2vec2-base",
-                                                                     num_labels=1)
-    def forward(self, x):
-        return self.model(x).logits
-
-class FilipowiczRes(nn.Module):
-    def __init__(self, input_size, clf_input_size, hidden_size):
-        super(FilipowiczRes, self).__init__()
-        self.resnet = ResNet18Arch(input_size, ResBlock, 256)
-        self.binary_clf_hid = torch.nn.Linear(in_features=clf_input_size, out_features=hidden_size)
-        self.binary_clf = torch.nn.Linear(in_features=hidden_size,out_features=1)
-
-    def forward(self, x):
-        x = x[:, None, :, :]
-        x = self.resnet(x)
-        out = self.binary_clf_hid(x)
-        out = self.binary_clf(out)
-        return out
-
-
-class Sheikh2022(nn.Module):
-    def __init__(self, batch_size):
-        super(Sheikh2022, self).__init__()
-        self.wav2vec2 = sb.lobes.models.huggingface_transformers.wav2vec2.Wav2Vec2("facebook/wav2vec2-base-960h",
-                                                                                 freeze=False,
-                                                                                 freeze_feature_extractor=True,
-                                                                                 save_path="./hugging_face",
-                                                                                 output_all_hiddens=True,
-                                                                                 output_norm=True)
+        self.fc1 = nn.Sequential(nn.Linear(in_features= 512,out_features=features_dim, bias=True),
+                                 nn.LeakyReLU())
         self.pooling = sb.nnet.pooling.StatisticsPooling(return_mean=True, return_std=True)
-        self.bin_classifier = ClassificationLayer(3*2*768, dropout=0.4)
+        self.bin_classifier = ClassificationLayer(features_dim*2, out_dim, dropout=dropout)
 
     def forward(self, x):
-        x = self.wav2vec2(x)
-        x = x.permute(1,2,3,0)
-        x = self.pooling(x)
-        x = x.permute(0,3,2,1)
-        x_mean, x_std = x.split(768,dim=2)
-        x = torch.stack((x_mean, x_std), 2)
-        x = x.squeeze(-1)
-        out = None
-        out = torch.index_select(x,1,torch.tensor([0,6,10]).to("cuda:0"))
+        out = self.whisper(x)
+        out = self.fc1(out)
+        out = self.pooling(out) #.permute(0,2,1)
         bin_out = self.bin_classifier(out)
         return bin_out
-
-
-class Whisper(nn.Module):
+    
+class Whisper2(nn.Module):
     def __init__(self):
-        super(Whisper, self).__init__()
-        self.whisper = sb.lobes.models.huggingface_transformers.whisper.Whisper("openai/whisper-base.en",
-                                                                                 encoder_only=True,
-                                                                                 freeze=False,
-                                                                                 freeze_encoder=True,
-                                                                                 save_path="./hugging_face")
+        super(Whisper2, self).__init__()
+        self.whisper = huggingface_transformers.whisper.Whisper("openai/whisper-base.en",
+                                                                encoder_only=False,
+                                                                freeze=False,
+                                                                freeze_encoder=True,
+                                                                save_path="./hugging_face")
+        
         self.fc1 = nn.Sequential(nn.Linear(in_features= 512,out_features=256, bias=True),
                                  nn.LeakyReLU())
-        self.pooling = sb.nnet.pooling.StatisticsPooling(return_mean=True, return_std=False)
-        self.bin_classifier = ClassificationLayer(256, dropout=0.4)
+        self.pooling = sb.nnet.pooling.StatisticsPooling(return_mean=True, return_std=True)
+        self.bin_classifier = ClassificationLayer(256*2, dropout=0.4)
 
     def forward(self, x):
-        x = self.whisper(x)
+        tokens = torch.tensor([[1, 1]]) * self.whisper.model.config.decoder_start_token_id
+        x, _, _ = self.whisper(x,tokens.to("cuda:0"))
         out = self.fc1(x)
         out = self.pooling(out) #.permute(0,2,1)
         bin_out = self.bin_classifier(out)
         return bin_out
-
-class Ameer(nn.Module):
-    def __init__(self):
-        super(Ameer, self).__init__()
-        self.whisper = sb.lobes.models.huggingface_transformers.whisper.Whisper("openai/whisper-base.en",
-                                                                                 encoder_only=True,
-                                                                                 freeze=False,
-                                                                                 freeze_encoder=False,
-                                                                                 save_path="./hugging_face")
-        self.fc1 = nn.Linear(in_features= 1500*512, out_features=1, bias=False)
-
-    def forward(self, x):
-        x = self.whisper(x)
-        x = torch.flatten(x,1)
-        out = self.fc1(x)
-        return out
 
 
 #doi.org/10.1007/978-3-031-48309-7_11
@@ -283,10 +129,10 @@ class Simha(nn.Module):
         #Classifier is SVM, LSTM or Bi-LSTM
         if(classifier=="lstm"):
             self.classifier = sb.nnet.RNN.LSTM(512, (None,94,20), num_layers = 1, dropout=0.2)
-            self.fc1 = nn.Linear(in_features= 512*94, out_features=1, bias=False)
+            self.fc1 = nn.Linear(in_features= 512*94, out_features=1, bias=True)
         elif(classifier=="bilstm"):
             self.classifier = sb.nnet.RNN.LSTM(512, (None,94,20), num_layers = 2, bidirectional=True, dropout=0.2)
-            self.fc1 = nn.Linear(in_features= 512*94*2, out_features=1, bias=False)
+            self.fc1 = nn.Linear(in_features= 512*94*2, out_features=1, bias=True)
         else:
             return
 
@@ -295,16 +141,6 @@ class Simha(nn.Module):
         out = torch.flatten(out,1)
         out = self.fc1(out)
         return out
-
-
-
-
-
-
-
-
-
-
 
 import os
 import wget

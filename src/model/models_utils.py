@@ -16,8 +16,8 @@ class ResNet18Arch(nn.Module):
         self.layer3 = nn.Sequential(resblock(128, 256, downsample=True), resblock(256, 256, downsample=False))
         self.layer4 = nn.Sequential(resblock(256, 512, downsample=True), resblock(512, 512, downsample=False))
         self.gap = torch.nn.AdaptiveAvgPool2d(1)
-        self.dropout = torch.nn.Dropout(dropout)
-        self.bilstm = torch.nn.LSTM(input_size=512, hidden_size=256, num_layers=2, bidirectional=True)
+        #self.dropout = torch.nn.Dropout(dropout)
+        #self.bilstm = torch.nn.LSTM(input_size=512, hidden_size=256, num_layers=2, bidirectional=True)
         self.fc = torch.nn.Linear(512, outputs)
 
     def forward(self, input):
@@ -26,10 +26,10 @@ class ResNet18Arch(nn.Module):
         input = self.layer2(input)
         input = self.layer3(input)
         input = self.layer4(input)
-        input = self.dropout(input)
+        #input = self.dropout(input)
         input = self.gap(input)
         input = torch.flatten(input, 1)
-        input, _ = self.bilstm(input)
+        #input, _ = self.bilstm(input)
         input = self.fc(input)
         return input
     
